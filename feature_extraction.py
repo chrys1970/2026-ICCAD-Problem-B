@@ -1,7 +1,7 @@
 import re
+import os
 
 def extract_regr_features(file_path):
-# define the variable
     features = {
         "is_mismatch": False,      
         "mismatch_index": None,    
@@ -12,8 +12,11 @@ def extract_regr_features(file_path):
         "verdict_failed": False
     }
 
+    if not os.path.exists(file_path):
+        return features
+    
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
 
             if "[FAILED]" in content:
@@ -33,6 +36,7 @@ def extract_regr_features(file_path):
             if stats:
                 features["matched_count"] = int(stats.group(1))
                 features["mismatch_count"] = int(stats.group(2))
+    return features
 
 #sim.log feature
 # UVM_<LEVEL> <FILE>(<LINE>) @ <TIME>: <ID> [<INSTANCE>]
@@ -68,25 +72,69 @@ def extract_sim_features(file_path, features):
                     else:
                         features["uvm_fatal_msg"] = line.strip()
 
-                # 3. catch UVM_ERROR
-                elif "UVM_ERROR" in line and features["max_uvm_level"] != "UVM_FATAL":
+                 # catch UVM_ERROR
+                 elif "UVM_ERROR" in line and features["max_uvm_level"] != "UVM_FATAL":
                     features["max_uvm_level"] = "UVM_ERROR"
                     msg_match = re.search(r"UVM_ERROR.*?@\s*\d+:\s*(.*?)\s*\[(.*?)\]\s*(.*)", line)
                     if msg_match:
                         features["uvm_error_msg"] = msg_match.group(3)
 
-                # 4. catch UVM_WARNING
-                elif "UVM_WARNING" in line and features["max_uvm_level"] not in ["UVM_FATAL", "UVM_ERROR"]:
+                 # catch UVM_WARNING
+                 elif "UVM_WARNING" in line and features["max_uvm_level"] not in ["UVM_FATAL", "UVM_ERROR"]:
                     features["max_uvm_level"] = "UVM_WARNING"
 
     except FileNotFoundError:
-    print(f"FAILED : non-founding the file {file_path}")
+        print(f"FAILED : non-founding the file {file_path}")
     except Exception as e:
-    print(f"ERROR within seeking data：{e}")
+        print(f"ERROR within seeking data：{e}")
 
     return features
 
+def extract_trace_features(file_path, features):
+    features.update({
+        "trace_final_pc": "None",
+        "pc_behavior": "Unknown"
+    })
+    
+    try:
+        if not os.path.exists(file_path): return features
+        
+        with open(file_path, 'rb') as f:
+            # avoiding scaning whole data, only the end part
+            f.seek(0, os.SEEK_END)
+            filesize = f.tell()
+            offset = min(filesize, 4000)
+            f.seek(-offset, os.SEEK_END)
+            lines = f.read().decode(errors='ignore').splitlines()
+            
+            pcs = []
+            for line in lines[-50:]: # take the last 50 lines (can adjust)
+                parts = line.split()
+                # take pc address
+                if len(parts) >= 3 and len(parts[2]) >= 8:
+                    pcs.append(parts[2])
+            
+            if pcs:
+                features["trace_final_pc"] = pcs[-1]
+                # Looping check: the number of special PC strongly less than total
+                if len(set(pcs)) < len(pcs) * 0.4:
+                    features["pc_behavior"] = "Looping"
+                else:
+                    features["pc_behavior"] = "Sudden_Stop"
+    except Exception as e:
+        print(f"Trace analysis error: {e}")
+    return features
 
-# --- 測試執行 ---
-# result = extract_regr_features("regr.log")
-# print(result)
+# --- processing code ---
+def run_full_extraction(case_id, regr_path, sim_path, trace_path):
+    # regr.log
+    feat = extract_regr_features(regr_path)
+    feat["case_id"] = case_id
+    
+    # sim.log
+    feat = extract_sim_features(sim_path, feat)
+    
+    # trace.log
+    feat = extract_trace_features(trace_path, feat)
+    
+    return feat
