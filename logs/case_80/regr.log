@@ -1,2 +1,0 @@
-Mismatch[1]: ibex[75] : pc[800001d6] c.lui x25,0xd: s9:0000d000
-[FAILED]: 77 matched, 4262 mismatch

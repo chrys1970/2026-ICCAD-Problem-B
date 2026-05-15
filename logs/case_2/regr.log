@@ -1,2 +1,0 @@
-Mismatch[1]: ibex[102] : pc[800004a2] c.lw x15,0x4(x2)
-[FAILED]: 101 matched, 1 mismatch
