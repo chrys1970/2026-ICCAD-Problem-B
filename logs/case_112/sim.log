@@ -1,1 +1,0 @@
-UVM_FATAL ibex/dv/uvm/tests/core_ibex_test_lib.sv(335) @ 93625000: uvm_test_top [uvm_test_top] No dret detected, or incorrect privilege mode switch in timeout period of 20000 cycles
