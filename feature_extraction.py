@@ -12,15 +12,16 @@ def extract_regr_features(file_path):
         "mismatch_count": 0
     }
     
-    if not os.path.exists(file_path):
+    if not os.path.exists(file_path): # safety check
         return features
 
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             # 1. Isolate the exact point of divergence (the Program Counter)
+            # look for digits + ibex + pc[hex] pattern; capture group
             mismatch_match = re.search(r"Mismatch\[\d+\]:\s*ibex\[\d+\]\s*:\s*pc\[([0-9a-fA-F]+)\]", line)
             if mismatch_match and not features["mismatch_pc"]:
-                features["mismatch_pc"] = mismatch_match.group(1) 
+                features["mismatch_pc"] = mismatch_match.group(1)  # save first capture group
             
             # 2. Capture the testbench verdict
             failed_match = re.search(r"^([a-zA-Z0-9_.]+)\s*:\s*\[FAILED\]", line)
@@ -32,9 +33,9 @@ def extract_regr_features(file_path):
             stats = re.search(stat_pattern, line)
             if stats:
                 features["matched_count"] = int(stats.group(1))
-                features["mismatch_count"] = int(stats.group(2))
+                features["mismatch_count"] = int(stats.group(2)) # type cast to int for future math
 
-    return features
+    return features # fully filled out dictionary with all 4 keys, some may be None or 0
 
 
 def extract_sim_features(file_path):
@@ -68,7 +69,7 @@ def extract_trace_features(file_path):
     Analyzes the tail lines of the CPU trace to detect repeating loopy patterns.
     """
     features = {
-        "unique_pc_ratio": 1.0,
+        "unique_pc_ratio": 1.0, # default to 1.0 (all unique) and will be reduced if we find repeats
         "is_stuck_in_loop": False
     }
     
@@ -79,9 +80,10 @@ def extract_trace_features(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
             # Focus only on the tail behavior to save time
-            tail_lines = lines[-100:] if len(lines) > 100 else lines
+            tail_lines = lines[-100:] if len(lines) > 100 else lines # analyze last 100 lines or fewer if file is small
             
             pcs = []
+            # extract the Program Counter from each line using regex; we assume it's the 3rd column in the trace
             for line in tail_lines:
                 parts = line.strip().split("\t")
                 if len(parts) >= 3:
@@ -103,7 +105,7 @@ def extract_trace_features(file_path):
 
     return features
 
-
+"""
 # --- INDEPENDENT TESTING BLOCK ---
 if __name__ == "__main__":
     print("--- Testing Feature Extraction (Regex Only) ---")
@@ -121,3 +123,4 @@ if __name__ == "__main__":
     print("Regr Features: ", extract_regr_features(f"{case2_dir}/regr.log"))
     print("Sim Features:  ", extract_sim_features(f"{case2_dir}/sim.log"))
     print("Trace Features:", extract_trace_features(f"{case2_dir}/trace.log"))
+"""
