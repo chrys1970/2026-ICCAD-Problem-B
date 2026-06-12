@@ -1,7 +1,0 @@
-regr.log 
-is_mismatch      whether the RTL and ISS are different    to classify the error type
-mismatch_index   the first error's retire index           the same bug might occur in same step of code 
-rtl_pc           the RTL address when error happening     the same address might have same type of bug
-expected_pc      ISS expected address                     whether the error is "calcularte wrong" or "jump error"
-matched_count    the number of steps before breaking      check the "alive length"
-verdict_failed   whether having FAILED label

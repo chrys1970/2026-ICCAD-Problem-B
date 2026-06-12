@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import os
+import random
+import numpy as np
+import time
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import normalize
+
+from feature_extraction import build_case_representation
+
+# Weight of the structured binary signals (has_mismatch / uvm_fatal / uvm_error /
+# is_timeout) relative to the L2-normalized text vector. ~2.0 makes the dominant
+# structural split reliable without overwhelming the semantic text.
+STRUCT_WEIGHT = 2.0
+
+# Determinism (the evaluation runs each benchmark only once).
+SEED = 0
+os.environ.setdefault("PYTHONHASHSEED", str(SEED))
+random.seed(SEED)
+np.random.seed(SEED)
+
+def main():
+    # Start the high-resolution timer
+    start_time = time.perf_counter()
+
+    parser = argparse.ArgumentParser(description="Regression Failure Bucketing")
+    parser.add_argument("--input", required=True, help="Path to input.csv")
+    parser.add_argument("--output", required=True, help="Path to save output.csv")
+    parser.add_argument("--k", type=int, required=True, help="Hint for number of clusters")
+    args = parser.parse_args()
+
+    # Log paths in input.csv are relative to the directory containing input.csv.
+    input_dir = os.path.dirname(os.path.abspath(args.input))
+
+    def resolve(path):
+        path = path.strip()
+        if not path:
+            return path
+        return path if os.path.isabs(path) else os.path.join(input_dir, path)
+
+    cases = []
+    print(f"Reading data from {args.input}...")
+    with open(args.input, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        for row in reader:
+            if len(row) >= 4:
+                # Input columns: Case, Regr Log, Sim Log, Trace Log
+                case_id, regr_log, sim_log, trace_log = row[:4]
+                cases.append({
+                    "trace": resolve(trace_log),
+                    "sim": resolve(sim_log),
+                    "regr": resolve(regr_log),
+                    "case_id": case_id.strip()
+                })
+
+    print(f"Building representations for {len(cases)} cases...")
+    documents = []
+    flags = []
+    for case in cases:
+        doc, flg = build_case_representation(case["regr"], case["sim"], case["trace"])
+        documents.append(doc)
+        flags.append(flg)
+
+    # Semantic representation: TF-IDF over word + short n-grams, so cases cluster
+    # by the *shape* of their failure (test words, UVM messages, markers).
+    vectorizer = TfidfVectorizer(
+        lowercase=False,
+        token_pattern=r"[A-Za-z0-9_]+",
+        ngram_range=(1, 2),
+        min_df=1,
+        sublinear_tf=True,
+    )
+    X_text = normalize(vectorizer.fit_transform(documents).toarray())
+
+    # Append the structured binary signals as an explicit, weighted axis.
+    S = np.asarray(flags, dtype=float)
+    if S.any():
+        S = normalize(S) * STRUCT_WEIGHT
+    X = np.hstack([X_text, S])
+
+    # Number of clusters can't exceed the number of cases.
+    n_clusters = max(1, min(args.k, len(cases)))
+    print(f"Running Agglomerative Clustering (cosine) with K={n_clusters}...")
+    if n_clusters == 1 or X.shape[0] == 1:
+        cluster_labels = np.zeros(len(cases), dtype=int)
+    else:
+        clusterer = AgglomerativeClustering(
+            n_clusters=n_clusters, metric="cosine", linkage="average"
+        )
+        cluster_labels = clusterer.fit_predict(X)
+
+    print(f"Saving results to {args.output}...")
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        # Output columns: Case, bucket  (one row per case, same order as input)
+        writer.writerow(["Case", "bucket"])
+        for case, label in zip(cases, cluster_labels):
+            writer.writerow([case["case_id"], f"bucket_{label}"])
+
+    # Stop the timer and calculate the difference
+    end_time = time.perf_counter()
+    execution_time = end_time - start_time
+    
+    print("Pipeline Complete!")
+    print(f"Total Execution Time: {execution_time:.4f} seconds")
+
+if __name__ == "__main__":
+    main()
