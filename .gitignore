@@ -2,6 +2,7 @@ venv/
 .venv/
 __pycache__/
 *.csv
+*.pdf
 logs/
 .DS_Store
 problem/
