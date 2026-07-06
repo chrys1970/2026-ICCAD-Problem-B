@@ -88,6 +88,14 @@ def main():
 
     cases = []
     print(f"Reading data from {args.input}...")
+
+    if not os.path.exists(args.input) or os.path.getsize(args.input) == 0:
+        print("Warning: input.csv is empty or missing. Generating empty output.")
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Case", "bucket"])
+        return
+
     with open(args.input, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
         header = next(reader)
