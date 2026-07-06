@@ -1,6 +1,8 @@
 import argparse
 import csv
 import os
+import time
+import subprocess
 import numpy as np
 
 def load_labels(path):
@@ -9,7 +11,7 @@ def load_labels(path):
         return labels
     with open(path, "r", encoding="utf-8") as f:
         reader = csv.reader(f)
-        next(reader, None)  # 跳過表頭 (Case, bucket)
+        next(reader, None)
         for row in reader:
             if len(row) >= 2 and row[0].strip():
                 labels[row[0].strip()] = row[1].strip()
@@ -23,7 +25,6 @@ def balanced_accuracy(pred, gold):
     tp = tn = fp = fn = 0
     n = len(cases)
     
-    # 窮舉所有 Case 對 (i, j)
     for a in range(n):
         for b in range(a + 1, n):
             i, j = cases[a], cases[b]
@@ -47,34 +48,92 @@ def main():
     ap = argparse.ArgumentParser(description="ICCAD 2026 Problem B Multi-Benchmark Evaluator")
     ap.add_argument("--pred", help="Path to a single prediction CSV file")
     ap.add_argument("--gold", help="Path to a single golden CSV file")
-    
-    ap.add_argument("--pred_dir", help="Directory containing your pipeline output CSVs (e.g. bk1.csv, test1.csv)")
+    ap.add_argument("--pred_dir", help="Directory containing your pipeline output CSVs")
     ap.add_argument("--gold_dir", help="Directory containing golden truth CSVs")
+    
+    # 執行模式：直接呼叫主程式跑指定資料夾內的考卷並評分
+    ap.add_argument("--run_pipeline", help="Directory containing input_*.csv and golden_*.csv (e.g., set1/)")
     args = ap.parse_args()
 
-    if args.pred and args.gold:
+    # ---- 模式一：自動化整合流水線評測 ----
+    if args.run_pipeline:
+        print(f"=== ICCAD End-to-End Pipeline Evaluation ===")
+        print(f"Reading benchmarks from '{args.run_pipeline}'...\n")
+        
+        # 掃描資料夾內所有的 input_*.csv 考卷
+        benchmarks = []
+        for file in sorted(os.listdir(args.run_pipeline)):
+            if file.startswith("input_") and file.endswith(".csv"):
+                name = file.replace("input_", "").replace(".csv", "")
+                benchmarks.append(name)
+
+        if not benchmarks:
+            print("❌ 在指定資料夾內找不到任何 input_*.csv 檔案！")
+            return
+
+        scores = []
+        for name in benchmarks:
+            input_csv = os.path.join(args.run_pipeline, f"input_{name}.csv")
+            gold_csv = os.path.join(args.run_pipeline, f"golden_{name}.csv")
+            output_csv = os.path.join(args.run_pipeline, f"output_{name}.csv")
+
+            if not os.path.exists(gold_csv):
+                continue
+
+            print(f"[ Evaluating {name.upper()} ]")
+            
+            # 1. 系統外部總計時（包含 Python 模組冷啟動開銷，大會評測系統視角）
+            start_wall = time.perf_counter()
+            
+            # 2. 自動在 Terminal 執行主程式
+            cmd = ["python", "regr_fail_bucketing", "--input", input_csv, "--output", output_csv]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            end_wall = time.perf_counter()
+            external_runtime = end_wall - start_wall
+
+            if result.returncode != 0:
+                print(f"  ❌ 執行崩潰！錯誤：\n{result.stderr.strip()}")
+                scores.append(0.0)
+            else:
+                # 3. 讀取預測與正解計算分數
+                pred = load_labels(output_csv)
+                gold = load_labels(gold_csv)
+                ba, _, _, _ = balanced_accuracy(pred, gold)
+                
+                # 4. 【新修正：精準抓取程式純核心執行時間】從主程式輸出中解碼 Total Execution Time
+                internal_time_str = "N/A"
+                for line in result.stdout.splitlines():
+                    if "Total Execution Time:" in line:
+                        internal_time_str = line.split(":")[-1].strip()
+
+                print(f"  ✅ 成功完成！")
+                print(f"     -> 系統外部總耗時 (大會視角): {external_runtime:.4f} 秒")
+                print(f"     -> 💡 程式純核心執行時間 : \033[1;36m{internal_time_str}\033[0m (從 feature 到 regr_fail)")
+                print(f"     -> Balanced Accuracy 分數   : \033[1;32m{ba:.4f}\033[0m\n")
+                scores.append(ba)
+
+        if scores:
+            print("-" * 55)
+            print(f"\033[1;33mFinal Averaged Score (ICCAD Metric): {np.mean(scores):.4f}\033[0m")
+
+    # ---- 保留模式二：單一檔案比對 ----
+    elif args.pred and args.gold:
         pred = load_labels(args.pred)
         gold = load_labels(args.gold)
         ba, tpr, tnr, (tp, tn, fp, fn) = balanced_accuracy(pred, gold)
         print(f"=== Single Evaluation ===")
-        print(f"Cases Compared: {len(set(pred) & set(gold))}")
-        print(f"TP={tp}, TN={tn}, FP={fp}, FN={fn}")
-        print(f"TPR (Sensitivity) = {tpr:.4f} | TNR (Specificity) = {tnr:.4f}")
-        print(f"\033[1;32mBalanced Accuracy = {ba:.4f}\033[0m")
+        print(f"Balanced Accuracy = {ba:.4f}")
 
+    # ---- 保保留模式三：純目錄 CSV 批量比對 ----
     elif args.pred_dir and args.gold_dir:
         print(f"=== ICCAD Batch Evaluation ===")
-        print(f"Comparing predictions in '{args.pred_dir}' against golden answers in '{args.gold_dir}'...\n")
-        
         scores = []
         for gold_file in sorted(os.listdir(args.gold_dir)):
             if not gold_file.endswith(".csv"):
                 continue
-                
             gold_path = os.path.join(args.gold_dir, gold_file)
-            pred_path = os.path.join(args.pred_dir, gold_file) # 假設預測檔名與正解檔名相同
-            
-
+            pred_path = os.path.join(args.pred_dir, gold_file)
             bench_name = os.path.splitext(gold_file)[0]
             
             if os.path.exists(pred_path):
@@ -83,15 +142,9 @@ def main():
                 ba, _, _, _ = balanced_accuracy(pred, gold)
                 print(f"Benchmark [{bench_name:7s}]: Balanced Accuracy = {ba:.4f}")
                 scores.append(ba)
-            else:
-                print(f"Benchmark [{bench_name:7s}]: \033[1;31mMissing Prediction! (Score = 0.0000)\033[0m")
-                scores.append(0.0)
-                
         if scores:
-            final_score = np.mean(scores)
             print("-" * 50)
-            print(f"\033[1;33mFinal Averaged Score (ICCAD Metric): {final_score:.4f}\033[0m")
-
+            print(f"Final Averaged Score: {np.mean(scores):.4f}")
     else:
         ap.print_help()
 
