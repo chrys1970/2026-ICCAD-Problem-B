@@ -135,6 +135,11 @@ def main():
         S = normalize(S) * STRUCT_WEIGHT
     X = np.hstack([X_text, S])
 
+    row_sums = np.sum(np.abs(X), axis=1)
+    zero_rows = (row_sums == 0)
+    if np.any(zero_rows):
+        X[zero_rows, 0] = 1e-6 #avoid the denominator becomes zero.
+
     # K (number of injected bugs) is not given in the input, so discover it
     # unless an explicit --k hint was provided.
     if args.k is not None:
