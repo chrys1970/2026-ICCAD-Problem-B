@@ -55,12 +55,11 @@ def main():
     ap.add_argument("--run_pipeline", help="Directory containing input_*.csv and golden_*.csv (e.g., set1/)")
     args = ap.parse_args()
 
-    # ---- 模式一：自動化整合流水線評測 ----
+    # mode one
     if args.run_pipeline:
         print(f"=== ICCAD End-to-End Pipeline Evaluation ===")
         print(f"Reading benchmarks from '{args.run_pipeline}'...\n")
         
-        # 掃描資料夾內所有的 input_*.csv 考卷
         benchmarks = []
         for file in sorted(os.listdir(args.run_pipeline)):
             if file.startswith("input_") and file.endswith(".csv"):
@@ -68,7 +67,7 @@ def main():
                 benchmarks.append(name)
 
         if not benchmarks:
-            print("❌ 在指定資料夾內找不到任何 input_*.csv 檔案！")
+            print("not found the file")
             return
 
         scores = []
@@ -82,10 +81,8 @@ def main():
 
             print(f"[ Evaluating {name.upper()} ]")
             
-            # 1. 系統外部總計時（包含 Python 模組冷啟動開銷，大會評測系統視角）
             start_wall = time.perf_counter()
             
-            # 2. 自動在 Terminal 執行主程式
             cmd = ["python", "regr_fail_bucketing", "--input", input_csv, "--output", output_csv]
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             
@@ -93,31 +90,26 @@ def main():
             external_runtime = end_wall - start_wall
 
             if result.returncode != 0:
-                print(f"  ❌ 執行崩潰！錯誤：\n{result.stderr.strip()}")
+                print(f"  ERROR：\n{result.stderr.strip()}")
                 scores.append(0.0)
             else:
-                # 3. 讀取預測與正解計算分數
                 pred = load_labels(output_csv)
                 gold = load_labels(gold_csv)
                 ba, _, _, _ = balanced_accuracy(pred, gold)
                 
-                # 4. 【新修正：精準抓取程式純核心執行時間】從主程式輸出中解碼 Total Execution Time
                 internal_time_str = "N/A"
                 for line in result.stdout.splitlines():
                     if "Total Execution Time:" in line:
                         internal_time_str = line.split(":")[-1].strip()
 
-                print(f"  ✅ 成功完成！")
-                print(f"     -> 系統外部總耗時 (大會視角): {external_runtime:.4f} 秒")
-                print(f"     -> 💡 程式純核心執行時間 : \033[1;36m{internal_time_str}\033[0m (從 feature 到 regr_fail)")
-                print(f"     -> Balanced Accuracy 分數   : \033[1;32m{ba:.4f}\033[0m\n")
+                print(f"  sucessful")
+                print(f"     -> total time {external_runtime:.4f} 秒")
+                print(f"     -> Balanced Accuracy   : \033[1;32m{ba:.4f}\033[0m\n")
                 scores.append(ba)
 
         if scores:
-            print("-" * 55)
             print(f"\033[1;33mFinal Averaged Score (ICCAD Metric): {np.mean(scores):.4f}\033[0m")
 
-    # ---- 保留模式二：單一檔案比對 ----
     elif args.pred and args.gold:
         pred = load_labels(args.pred)
         gold = load_labels(args.gold)
@@ -125,7 +117,6 @@ def main():
         print(f"=== Single Evaluation ===")
         print(f"Balanced Accuracy = {ba:.4f}")
 
-    # ---- 保保留模式三：純目錄 CSV 批量比對 ----
     elif args.pred_dir and args.gold_dir:
         print(f"=== ICCAD Batch Evaluation ===")
         scores = []
@@ -143,7 +134,6 @@ def main():
                 print(f"Benchmark [{bench_name:7s}]: Balanced Accuracy = {ba:.4f}")
                 scores.append(ba)
         if scores:
-            print("-" * 50)
             print(f"Final Averaged Score: {np.mean(scores):.4f}")
     else:
         ap.print_help()
