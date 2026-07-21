@@ -1,6 +1,7 @@
 import argparse
 import csv
 import os
+import sys
 import time
 import subprocess
 import numpy as np
@@ -83,7 +84,7 @@ def main():
             
             start_wall = time.perf_counter()
             
-            cmd = ["python", "regr_fail_bucketing", "--input", input_csv, "--output", output_csv]
+            cmd = [sys.executable, "regr_fail_bucketing", "--input", input_csv, "--output", output_csv]
             result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             
             end_wall = time.perf_counter()
