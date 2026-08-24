@@ -1002,14 +1002,14 @@ def _build_and_cluster(docs_small, docs_large, flags, numeric, traces, hint, lar
     D /= total
 
     # Cross-program synchronisation
-    #if large:
-        #Dsync, n_groups = sync_distance(D, [t[4] for t in traces], hint)
-        #if Dsync is not None:
-         #   _log(f"cross-program sync: {n_groups} programs matched -> "
-          #       f"clustering the synchronised embedding")
-           # return choose_clusters(Dsync, hint=hint)
-        #_log(f"cross-program sync unavailable ({n_groups} usable programs) "
-         #    f"-> clustering the blended distance")
+    if large:
+        Dsync, n_groups = sync_distance(D, [t[4] for t in traces], hint)
+        if Dsync is not None:
+            _log(f"cross-program sync: {n_groups} programs matched -> "
+                 f"clustering the synchronised embedding")
+            return choose_clusters(Dsync, hint=hint)
+        _log(f"cross-program sync unavailable ({n_groups} usable programs) "
+             f"-> clustering the blended distance")
     return choose_clusters(D, hint=hint)
 
 
