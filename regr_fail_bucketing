@@ -442,10 +442,11 @@ def _tail_document(tail_feat):
     return " ".join(parts) or "NONE"
 
 
-def extract_trace_features(file_path):
+def extract_trace_features(file_path, anchor_pc=None):
     """Parse the head of a trace log.
-
     Returns a dict with pc_writes and summary stats over the same window
+
+    08-24 if the file has anchor_pc, it should scan the place where the pc first time appear.
     """
     feat = {
         "pc_writes": {},
