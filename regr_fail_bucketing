@@ -11,6 +11,7 @@ import os
 import random
 import re
 import sys
+import collections
 
 
 def write_output(path, rows):
@@ -93,6 +94,48 @@ def _read_head_bytes(file_path, nbytes):
             return f.read(nbytes).decode("utf-8", "replace")
     except Exception:
         return ""
+
+
+_TRACE_ANCHOR_BEFORE_ROWS = 20
+_TRACE_ANCHOR_SCAN_CAP = 1 << 20
+
+def _read_anchored_text(file_path, anchor_pc, before_rows=_TRACE_ANCHOR_BEFORE_ROWS,
+                         after_rows=_TRACE_ROWS, scan_cap=_TRACE_ANCHOR_SCAN_CAP):
+    """focus on anchor_pc appearing the first time, to avoid the same form's cases injects
+        the different bugs. 
+    """
+    if not anchor_pc or not file_path or not os.path.exists(file_path) \
+            or os.path.getsize(file_path) == 0:
+        return None
+    anchor_norm = anchor_pc.lstrip("0").lower() or "0"
+    try:
+        opener = gzip.open if file_path.endswith(".gz") else open
+        with opener(file_path, "rt", encoding="utf-8", errors="replace") as f:
+            header = f.readline()
+            before = collections.deque(maxlen=before_rows)
+            scanned = 0
+            found_lines = None
+            for line in f:
+                scanned += len(line)
+                cols = line.split("\t")
+                pc = cols[2].lstrip("0").lower() if len(cols) > 2 else ""
+                if pc == anchor_norm:
+                    found_lines = list(before)
+                    found_lines.append(line)
+                    for _ in range(after_rows - 1):
+                        nxt = f.readline()
+                        if not nxt:
+                            break
+                        found_lines.append(nxt)
+                    break
+                before.append(line)
+                if scanned >= scan_cap:
+                    break
+            if found_lines is None:
+                return None
+            return header + "".join(found_lines)
+    except Exception:
+        return None
 
 
 # --- divergence fingerprint ---
@@ -456,7 +499,11 @@ def extract_trace_features(file_path, anchor_pc=None):
         "gz_size": os.path.getsize(file_path)
         if file_path and os.path.exists(file_path) else 0,
     }
-    text = _read_head_bytes(file_path, _TRACE_HEAD_BYTES)
+    text = None
+    if anchor_pc:
+        text = _read_anchored_text(file_path, anchor_pc)
+    if text is None:
+        text = _read_head_bytes(file_path, _TRACE_HEAD_BYTES)
     if not text:
         return feat
 
@@ -642,7 +689,8 @@ def build_case_representation(regr_path, sim_path, trace_path, large=False):
     """
     regr_feat = extract_regr_features(regr_path)
     sim_feat = extract_sim_features(sim_path)
-    trace_feat = extract_trace_features(trace_path) if large else None
+    trace_feat = extract_trace_features(
+        trace_path, anchor_pc=regr_feat.get("mismatch_pc")) if large else None
     tail_doc = _tail_document(extract_tail_features(trace_path)) if large else ""
 
     # Build both weight profiles for every case. 
