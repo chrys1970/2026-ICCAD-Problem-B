@@ -484,6 +484,7 @@ def _tail_document(tail_feat):
     parts.append("NL_%d" % min(tail_feat["nloop"], 40))
     return " ".join(parts) or "NONE"
 
+_ANCHOR_HIT_COUNT = [0, 0]  # [hits, total]
 
 def extract_trace_features(file_path, anchor_pc=None):
     """Parse the head of a trace log.
@@ -502,6 +503,9 @@ def extract_trace_features(file_path, anchor_pc=None):
     text = None
     if anchor_pc:
         text = _read_anchored_text(file_path, anchor_pc)
+    _ANCHOR_HIT_COUNT[1] += 1
+    if text is not None:
+            _ANCHOR_HIT_COUNT[0] += 1
     if text is None:
         text = _read_head_bytes(file_path, _TRACE_HEAD_BYTES)
     if not text:
@@ -681,7 +685,6 @@ def _document(regr_feat, sim_feat, w_testword, w_src_tb, w_src_all,
         parts += ["TIMEOUT_FLAG"] * W_FLAG
 
     return " ".join(p for p in parts if p)
-
 
 def build_case_representation(regr_path, sim_path, trace_path, large=False):
     """Build the representation for one failure case.
@@ -988,13 +991,13 @@ np.random.seed(SEED)
 
 def _build_and_cluster(docs_small, docs_large, flags, numeric, traces, hint, large):
     """Vectorize every signal into one blended distance matrix and cluster it."""
-    if large:
-        usable = sum(1 for t in traces if t[0] and t[0]["pc_writes"])
-        if usable < _TRACE_MIN_COVERAGE * max(len(traces), 1):
-            _log(f"guard: only {usable}/{len(traces)} cases have a usable "
-                 f"trace (need {_TRACE_MIN_COVERAGE:.0%}) -> symptom-only "
-                 f"model")
-            large = False
+    #if large:
+     #   usable = sum(1 for t in traces if t[0] and t[0]["pc_writes"])
+      #  if usable < _TRACE_MIN_COVERAGE * max(len(traces), 1):
+       #     _log(f"guard: only {usable}/{len(traces)} cases have a usable "
+        #         f"trace (need {_TRACE_MIN_COVERAGE:.0%}) -> symptom-only "
+         #        f"model")
+          #  large = False
 
     Dpc = None
     if large and W_PC:
@@ -1186,3 +1189,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    _log(f"anchor hit rate: {_ANCHOR_HIT_COUNT[0]}/{_ANCHOR_HIT_COUNT[1]}")
