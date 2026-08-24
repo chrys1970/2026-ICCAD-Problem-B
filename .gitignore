@@ -15,3 +15,10 @@ sets_drive/
 holdout/
 holdout[0-9]*/
 holdouts_raw/
+eval_merged/
+eval_x/
+.featcache_*.pkl
+.divfp.pkl
+.progid.pkl
+eval_holdout*/
+eval_holdout*-*.zip

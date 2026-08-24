@@ -29,14 +29,7 @@ def write_output(path, rows):
 
 
 def _log(msg):
-    """One progress line, stamped with elapsed wall-clock and flushed at once.
-
-    Both halves matter under a runtime limit. The stamp says WHERE the time
-    went, so a run that died at 300 s can be diagnosed from its log alone.
-    The flush is what makes that log exist: stdout is block-buffered when it is
-    piped or redirected, so a killed process would otherwise take every line it
-    had "printed" to the grave.
-    """
+    """One progress line, stamped with elapsed wall-clock and flushed at once."""
     print(f"[{time.perf_counter() - _START_TIME:6.1f}s] {msg}", flush=True)
 
 
@@ -69,6 +62,7 @@ _bootstrap_fallback_output()
 
 import numpy as np
 from scipy import sparse
+from scipy.optimize import linear_sum_assignment
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import silhouette_score
@@ -101,6 +95,46 @@ def _read_head_bytes(file_path, nbytes):
         return ""
 
 
+# --- divergence fingerprint ---
+_DIV_SIDE_RE = re.compile(r"^\s*(ibex|spike)\[(\d+)\]\s*:")
+_DIV_RV_RE = re.compile(r"([a-z][a-z0-9]*)\s*:\s*([0-9a-fA-F]{8})\s*$")
+# pc on either side of a Mismatch[N] entry, for the PC-skew feature below
+_DIV_PC_RE = re.compile(r"pc\[([0-9a-fA-F]+)\]")
+_DIV_N_FLAGS = 10
+
+
+def _summarize_divergence(features, div_pairs):
+    """Reduce paired (ibex, spike) retired writes to rate vectors."""
+    bits = [0.0] * 32
+    flags = [0.0] * _DIV_N_FLAGS
+    n = 0
+    for idx in sorted(div_pairs):
+        d = div_pairs[idx]
+        if "ibex" not in d or "spike" not in d:
+            continue
+        (i_reg, i_val), (s_reg, s_val) = d["ibex"], d["spike"]
+        n += 1
+        x = (i_val ^ s_val) & 0xFFFFFFFF
+        for b in range(32):
+            if x >> b & 1:
+                bits[b] += 1.0
+        pop = bin(x).count("1")
+        flags[0] += i_val == 0
+        flags[1] += s_val == 0
+        flags[2] += x == 0xFFFFFFFF          # fully inverted
+        flags[3] += pop == 1                 # single-bit flip
+        flags[4] += i_val == (s_val + 1) & 0xFFFFFFFF
+        flags[5] += i_val == (s_val - 1) & 0xFFFFFFFF
+        flags[6] += (x & 0x0000FFFF) == 0    # only the high half differs
+        flags[7] += (x & 0xFFFF0000) == 0    # only the low half differs
+        flags[8] += i_reg != s_reg           # wrote a different register
+        flags[9] += i_val == 0xFFFFFFFF
+    if n:
+        features["div_bits"] = [b / n for b in bits]
+        features["div_flags"] = [float(f) / n for f in flags]
+        features["n_div"] = n
+
+
 def extract_regr_features(file_path):
     """
     Extracts mismatch PCs, failed test names, and match/mismatch statistics using purely Regex.
@@ -113,18 +147,43 @@ def extract_regr_features(file_path):
         "mismatch_count": 0,
         # mistmach instructions -- where exactly the behavior doesn't match expected
         "mismatch_insns": [],
+        # divergence fingerprint
+        "div_bits": [0.0] * 32,
+        "div_flags": [0.0] * _DIV_N_FLAGS,
+        "n_div": 0,
         # sizes/counts feeding the numeric fingerprint below
         "n_mism_lines": 0,
         "regr_len": 0,
+        # PC skew at the first divergence
+        "pc_skew": None,
     }
 
     f = _open_log(file_path)
     if f is None:
         return features
 
+    # index -> {"ibex": (reg, value), "spike": (reg, value)}; the two sides of
+    # one Mismatch[N] entry are paired on N.
+    div_pairs = {}
+    # index -> {"ibex": pc, "spike": pc} for the first paired Mismatch entry
+    pc_sides = {}
+
     with f:
         for line in f:
             features["regr_len"] += len(line)
+
+            # 0. Retired (register, value) on either side of a divergence.
+            side = _DIV_SIDE_RE.match(line)
+            if side:
+                rv = _DIV_RV_RE.search(line)
+                if rv:
+                    div_pairs.setdefault(int(side.group(2)), {})[side.group(1)] = (
+                        rv.group(1), int(rv.group(2), 16))
+                pc = _DIV_PC_RE.search(line)
+                if pc:
+                    pc_sides.setdefault(int(side.group(2)), {})[side.group(1)] = \
+                        int(pc.group(1), 16)
+
             # 1. Isolate exact point of mismatch; capture instruction + regard for newline.
             mismatch_match = re.search(
                 r"ibex\[\d+\]\s*:\s*pc\[([0-9a-fA-F]+)\]\s+([a-z][a-z0-9._]*)?",
@@ -149,6 +208,15 @@ def extract_regr_features(file_path):
                 features["matched_count"] = int(stats.group(1))
                 features["mismatch_count"] = int(stats.group(2))
 
+    for idx in sorted(pc_sides):
+        pair = pc_sides[idx]
+        if "ibex" in pair and "spike" in pair:
+            # spike prints a sign-extended 64-bit pc; compare the low 32 bits
+            features["pc_skew"] = abs((pair["ibex"] & 0xFFFFFFFF)
+                                      - (pair["spike"] & 0xFFFFFFFF))
+            break
+
+    _summarize_divergence(features, div_pairs)
     return features
 
 
@@ -172,12 +240,15 @@ def extract_sim_features(file_path):
         # new keys 2
         "src_sites": set(),
         "assert_names": set(),
+        # (generated program, simulation seed) -- see _PROG_* below
+        "prog_id": None,
     }
 
     f = _open_log(file_path)
     if f is None:
         return features
 
+    prog_bin = prog_seed = None
     macro_re = re.compile(r"\bUVM_(FATAL|ERROR)\b\s+\S+\(\d+\)\s*@")
     summary_re = re.compile(r"^\s*UVM_(FATAL|ERROR)\s*:\s*(\d+)\s*$")
     # allow the seed suffix on the generated-program name
@@ -207,6 +278,15 @@ def extract_sim_features(file_path):
                 t = testname_re.search(line)
                 if t:
                     features["riscv_test"] = t.group(0)
+
+            # program identity
+            if prog_bin is None and lineno < _TESTNAME_SCAN_LINES:
+                pb = _PROG_BIN_RE.search(line)
+                if pb:
+                    prog_bin = pb.group(1).rsplit("/", 1)[-1]
+                ps = _PROG_SEED_RE.search(line)
+                if ps:
+                    prog_seed = ps.group(1)
 
             m = macro_re.search(line)
             if m:
@@ -249,8 +329,13 @@ def extract_sim_features(file_path):
                     else:
                         features["uvm_error"] = True
 
+    if prog_bin:
+        features["prog_id"] = "%s@%s" % (prog_bin, prog_seed or "?")
     return features
 
+
+_PROG_BIN_RE = re.compile(r"\+bin=(\S+)")
+_PROG_SEED_RE = re.compile(r"\+ntb_random_seed=(\d+)")
 
 # generated test name lives in the first ~100 header lines of sim.log
 _TESTNAME_SCAN_LINES = 400
@@ -291,6 +376,70 @@ _MNEM_CLASSES = (
     ("sys", {"ecall", "ebreak", "mret", "dret", "wfi", "c_ebreak", "fence", "fence_i"}),
     ("inv", {"INVALID"}),
 )
+
+
+# --- tail of trace ---
+_TAIL_CAP_BYTES = 32 << 20      # stop decompressing one case past this
+_TAIL_KEEP_BYTES = 96 << 10     # rolling window kept while streaming
+_TAIL_ROWS = 200                # retired instructions summarised
+_TAIL_LOOP_ROWS = 50            # window used to size the terminal loop
+_TAIL_PA_MAX = 60               # data addresses kept
+_TAIL_PA_RE = re.compile(r"(?:PA|store|load):0x([0-9a-f]+)")
+
+
+def extract_tail_features(file_path):
+    """Summarise the last retired instructions before the case died."""
+    feat = {"mnems": [], "pas": [], "loop_pcs": [], "nloop": 0}
+    if not file_path or not os.path.exists(file_path):
+        return feat
+    try:
+        opener = gzip.open if file_path.endswith(".gz") else open
+        with opener(file_path, "rb") as f:
+            buf = b""
+            total = 0
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                buf = (buf + chunk)[-_TAIL_KEEP_BYTES:]
+                if total >= _TAIL_CAP_BYTES:
+                    break
+        text = buf.decode("utf-8", "replace")
+    except Exception:
+        return feat
+    if not text:
+        return feat
+
+    rows = []
+    for line in text.split("\n")[1:]:
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        pc = cols[2].strip()
+        if len(pc) < 4:
+            continue
+        rows.append((pc, cols[4].strip().replace(".", "_"), cols[-1]))
+    if not rows:
+        return feat
+    rows = rows[-_TAIL_ROWS:]
+    feat["mnems"] = [r[1] for r in rows]
+    feat["loop_pcs"] = sorted({r[0] for r in rows[-_TAIL_LOOP_ROWS:]})
+    feat["nloop"] = len(feat["loop_pcs"])
+    pas = []
+    for r in rows:
+        pas.extend(_TAIL_PA_RE.findall(r[2]))
+    feat["pas"] = pas[-_TAIL_PA_MAX:]
+    return feat
+
+
+def _tail_document(tail_feat):
+    """Token document for the tail block."""
+    parts = ["M_" + m for m in tail_feat["mnems"]]
+    parts += ["A_" + a for a in tail_feat["pas"]] * W_TAIL_PA_REPEAT
+    parts += ["S_" + p for p in tail_feat["loop_pcs"]]
+    parts.append("NL_%d" % min(tail_feat["nloop"], 40))
+    return " ".join(parts) or "NONE"
 
 
 def extract_trace_features(file_path):
@@ -388,6 +537,10 @@ W_MISM_INSN = 2    # each distinct diverging mnemonic
 W_MISM_INSN1 = 3  # the first diverging mnemonic (strongest)
 
 # --- Weights that differ between the two profiles. ---
+W_PC_SKEW_SMALL = 6         # coarse SAME / LOCAL / FAR band
+W_PC_SKEW_LARGE = 0
+W_PC_SKEW_MAG_SMALL = 2     # log2 bucket of the skew, for graded similarity
+W_PC_SKEW_MAG_LARGE = 0
 W_TESTWORD_SMALL = 1   # individual words of the riscv test name
 W_TESTWORD_LARGE = 0
 W_SRC_TB_SMALL = 3       # fatal fired from testbench code
@@ -397,9 +550,14 @@ W_SRC_ALL_LARGE = 4
 
 # --- distance blend (large profile only) ---
 # Final distance = (W_TEXT*D_symptom + W_NUM*D_numeric + W_PC*D_tracefp) / sum.
-W_TEXT = 1.0
-W_NUM = 0.5
+W_TEXT = 0.5
+W_NUM = 2.0
 W_PC = 2.0
+W_DIV = 2.0
+# The tail block is the heaviest single signal on the RTL-bug sets
+W_TAIL = 8.0
+# Data addresses touched in the tail are the most discriminative, emitted twice
+W_TAIL_PA_REPEAT = 2
 
 # Test-name words mapped to a coarse category. 
 _CAT_DEBUG_WORDS = {"debug", "ebreak", "ebreakmu", "dret"}
@@ -407,7 +565,8 @@ _CAT_IRQCSR_WORDS = {"interrupt", "irq", "csr"}
 _CAT_MEM_WORDS = {"mem", "load", "store", "unaligned", "mmu"}
 
 
-def _document(regr_feat, sim_feat, w_testword, w_src_tb, w_src_all):
+def _document(regr_feat, sim_feat, w_testword, w_src_tb, w_src_all,
+              w_skew=0, w_skew_mag=0):
     """Assemble the weighted symptom-token document for one case."""
     parts = []
     has_mismatch = (regr_feat.get("mismatch_count") or 0) > 0
@@ -451,10 +610,21 @@ def _document(regr_feat, sim_feat, w_testword, w_src_tb, w_src_all):
 
     # Diverging-instruction fingerprint, first gets extra weight
     insns = regr_feat.get("mismatch_insns") or []
-    for mnem in set(insns):
+    # sorted(), not set() bc we want deterministic output for the same case
+    for mnem in sorted(set(insns)):
         parts += [f"MISM_{mnem}"] * W_MISM_INSN
     if insns:
         parts += [f"MISM1_{insns[0]}"] * W_MISM_INSN1
+
+    # How far apart the two models were when they first disagreed
+    skew = regr_feat.get("pc_skew")
+    if skew is not None:
+        if w_skew:
+            band = "SAME" if skew == 0 else ("LOCAL" if skew < 4096 else "FAR")
+            parts += [f"PCSK_{band}"] * w_skew
+        if w_skew_mag:
+            mag = 0 if skew == 0 else min(int(math.log2(skew)) + 1, 24)
+            parts += [f"PCSKM_{mag}"] * w_skew_mag
     if sim_feat.get("uvm_fatal"):
         parts += ["UVM_FATAL_FLAG"] * W_FLAG
     if sim_feat.get("uvm_error"):
@@ -472,12 +642,15 @@ def build_case_representation(regr_path, sim_path, trace_path, large=False):
     regr_feat = extract_regr_features(regr_path)
     sim_feat = extract_sim_features(sim_path)
     trace_feat = extract_trace_features(trace_path) if large else None
+    tail_doc = _tail_document(extract_tail_features(trace_path)) if large else ""
 
     # Build both weight profiles for every case. 
     doc_small = _document(regr_feat, sim_feat,
-                          W_TESTWORD_SMALL, W_SRC_TB_SMALL, W_SRC_ALL_SMALL)
+                          W_TESTWORD_SMALL, W_SRC_TB_SMALL, W_SRC_ALL_SMALL,
+                          W_PC_SKEW_SMALL, W_PC_SKEW_MAG_SMALL)
     doc_large = _document(regr_feat, sim_feat,
-                          W_TESTWORD_LARGE, W_SRC_TB_LARGE, W_SRC_ALL_LARGE) \
+                          W_TESTWORD_LARGE, W_SRC_TB_LARGE, W_SRC_ALL_LARGE,
+                          W_PC_SKEW_LARGE, W_PC_SKEW_MAG_LARGE) \
         if large else doc_small
 
     flags = [
@@ -500,7 +673,10 @@ def build_case_representation(regr_path, sim_path, trace_path, large=False):
             math.log1p(regr_feat.get("regr_len", 0)),
         ] + list(t["mnem_frac"])
 
-    return doc_small, doc_large, flags, numeric, (trace_feat, sim_feat.get("riscv_test"))
+    div_vec = regr_feat["div_bits"] + regr_feat["div_flags"]
+    return (doc_small, doc_large, flags, numeric,
+            (trace_feat, sim_feat.get("riscv_test"), div_vec,
+             regr_feat["n_div"], sim_feat.get("prog_id"), tail_doc))
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +776,32 @@ def trace_fp_distance(trace_feats):
     return np.clip(D, 0.0, 1.0, out=D), coverage
 
 
+def divergence_distance(div_vecs, n_divs):
+    """Distance between cases by how their retired values diverged from spike.
+
+    Returns ``(D, coverage)``.
+    """
+    n = len(div_vecs)
+    D = np.full((n, n), 0.5, dtype=np.float32)
+    np.fill_diagonal(D, 0.0)
+    if n < 2:
+        return D, 0.0
+    have = np.asarray([bool(k) for k in n_divs])
+    if have.sum() < 2:
+        return D, 0.0
+    V = np.asarray(div_vecs, dtype=np.float32)
+    norm = np.linalg.norm(V, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    U = V / norm
+    Dv = 1.0 - U @ U.T
+    ok = have[:, None] & have[None, :]
+    np.fill_diagonal(ok, False)
+    coverage = float(ok.sum()) / max(n * (n - 1), 1)
+    D = np.where(ok, Dv, float(Dv[ok].mean())).astype(np.float32)
+    np.fill_diagonal(D, 0.0)
+    return np.clip(D, 0.0, 2.0, out=D), coverage
+
+
 def numeric_distance(numeric, test_names):
     """Distance over the continuous bug-effect statistics.
 
@@ -619,6 +821,76 @@ def numeric_distance(numeric, test_names):
     sd = out.std(axis=0)
     sd[sd == 0] = 1.0
     return _cos_distance((out - out.mean(axis=0)) / sd)
+
+
+# A program contributing a single failure still gets matched
+_SYNC_MIN_GROUP = 1
+_SYNC_MIN_GROUPS = 3
+# fraction of cases that must yield a program id
+_SYNC_MIN_IDENTIFIED = 0.5
+# Weight given to each program pair's second-best assignment
+_SYNC_ALT_WEIGHT = 0.25
+# Eigenvectors kept beyond K
+_SYNC_EXTRA_DIMS = 16
+
+
+def sync_distance(D, prog_ids, k):
+    """Re-derive the distance from cross-program failure matching.
+
+    Hungarian matching -> synchronized distance matrix -> spectral embedding -> new distance matrix
+
+    A case's coordinates say which bug slot it
+    occupies, and cases in the same slot across many programs land together.
+
+    Returns ``(D_sync, n_groups)``, or ``(None, n_groups)`` when the grid
+    structure is too thin to exploit.
+    """
+    n = D.shape[0]
+    if k is None or k < 2:
+        return None, 0
+    ident = sum(1 for p in prog_ids if p)
+    if ident < _SYNC_MIN_IDENTIFIED * max(n, 1):
+        return None, 0
+    buckets = {}
+    for i, p in enumerate(prog_ids):
+        # A case whose sim.log went missing has no program id
+        buckets.setdefault(p or ("?", i), []).append(i)
+    groups = [np.asarray(v) for v in buckets.values() if len(v) >= _SYNC_MIN_GROUP]
+    if len(groups) < _SYNC_MIN_GROUPS:
+        return None, len(groups)
+
+    W = np.zeros((n, n), dtype=np.float32)
+    for a in range(len(groups)):
+        ga = groups[a]
+        for b in range(a + 1, len(groups)):
+            gb = groups[b]
+            C = D[np.ix_(ga, gb)].copy()
+            rows, cols = linear_sum_assignment(C)
+            W[ga[rows], gb[cols]] = 1.0
+            W[gb[cols], ga[rows]] = 1.0
+            # runner-up assignment, at partial weight
+            C[rows, cols] = np.inf
+            if np.isfinite(C).any():
+                r2, c2 = linear_sum_assignment(np.where(np.isfinite(C), C, 1e6))
+                ok = np.isfinite(C[r2, c2])
+                r2, c2 = r2[ok], c2[ok]
+                if len(r2):
+                    W[ga[r2], gb[c2]] = np.maximum(W[ga[r2], gb[c2]],
+                                                   _SYNC_ALT_WEIGHT)
+                    W[gb[c2], ga[r2]] = np.maximum(W[gb[c2], ga[r2]],
+                                                   _SYNC_ALT_WEIGHT)
+    np.fill_diagonal(W, 1.0)
+
+    W = (W + W.T) / 2.0
+    vals, vecs = np.linalg.eigh(W.astype(np.float64))
+    dims = min(k + _SYNC_EXTRA_DIMS, W.shape[0])
+    U = vecs[:, -dims:] * np.sqrt(np.maximum(vals[-dims:], 0.0))
+    norm = np.linalg.norm(U, axis=1, keepdims=True)
+    norm[norm == 0] = 1.0
+    U /= norm
+    Ds = (1.0 - U @ U.T).astype(np.float32)
+    np.fill_diagonal(Ds, 0.0)
+    return np.clip(Ds, 0.0, 2.0, out=Ds), len(groups)
 
 
 def _cluster(D, k):
@@ -667,22 +939,21 @@ np.random.seed(SEED)
 
 def _build_and_cluster(docs_small, docs_large, flags, numeric, traces, hint, large):
     """Vectorize every signal into one blended distance matrix and cluster it."""
-    # Guard 1: is the trace log usable, if not do symptom
     if large:
         usable = sum(1 for t in traces if t[0] and t[0]["pc_writes"])
         if usable < _TRACE_MIN_COVERAGE * max(len(traces), 1):
             _log(f"guard: only {usable}/{len(traces)} cases have a usable "
-                 f"trace (need {_TRACE_MIN_COVERAGE:.0%}) -> symptom-only model")
+                 f"trace (need {_TRACE_MIN_COVERAGE:.0%}) -> symptom-only "
+                 f"model")
             large = False
 
-    # Guard 2: is it even useful (what if theyre all below the overlap floor)
     Dpc = None
     if large and W_PC:
         Dpc, coverage = trace_fp_distance([t[0] for t in traces])
         if coverage < _TRACE_MIN_PAIR_COVERAGE:
             _log(f"guard: trace fingerprint covers {coverage:.1%} of case pairs "
-                 f"(need {_TRACE_MIN_PAIR_COVERAGE:.0%}) -> symptom-only model")
-            large = False
+                 f"(need {_TRACE_MIN_PAIR_COVERAGE:.0%}) -> dropping the trace "
+                 f"block, keeping numeric + divergence")
             Dpc = None
 
     documents = docs_large if large else docs_small
@@ -711,7 +982,34 @@ def _build_and_cluster(docs_small, docs_large, flags, numeric, traces, hint, lar
         if Dpc is not None:
             D += W_PC * Dpc
             total += W_PC
+        if W_DIV:
+            Ddiv, div_cov = divergence_distance([t[2] for t in traces],
+                                                [t[3] for t in traces])
+            if div_cov > 0.0:
+                _log(f"divergence fingerprint covers {div_cov:.1%} of case "
+                     f"pairs")
+                D += W_DIV * Ddiv
+                total += W_DIV
+        if W_TAIL:
+            tail_docs = [t[5] for t in traces]
+            if any(d != "NONE" for d in tail_docs):
+                tv = TfidfVectorizer(lowercase=False,
+                                     token_pattern=r"[A-Za-z0-9_]+",
+                                     min_df=1, sublinear_tf=True)
+                Xt = normalize(tv.fit_transform(tail_docs).toarray())
+                D += W_TAIL * _cos_distance(Xt)
+                total += W_TAIL
     D /= total
+
+    # Cross-program synchronisation
+    if large:
+        Dsync, n_groups = sync_distance(D, [t[4] for t in traces], hint)
+        if Dsync is not None:
+            _log(f"cross-program sync: {n_groups} programs matched -> "
+                 f"clustering the synchronised embedding")
+            return choose_clusters(Dsync, hint=hint)
+        _log(f"cross-program sync unavailable ({n_groups} usable programs) "
+             f"-> clustering the blended distance")
     return choose_clusters(D, hint=hint)
 
 
