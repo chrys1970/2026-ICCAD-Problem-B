@@ -100,7 +100,7 @@ _TRACE_ANCHOR_BEFORE_ROWS = 20
 _TRACE_ANCHOR_SCAN_CAP = 1 << 20
 
 def _read_anchored_text(file_path, anchor_pc, before_rows=_TRACE_ANCHOR_BEFORE_ROWS,
-                         after_rows=_TRACE_ROWS, scan_cap=_TRACE_ANCHOR_SCAN_CAP):
+                         after_rows=100, scan_cap=_TRACE_ANCHOR_SCAN_CAP):
     """focus on anchor_pc appearing the first time, to avoid the same form's cases injects
         the different bugs. 
     """
